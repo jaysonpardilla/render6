@@ -3,8 +3,10 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import mediapipe as mp
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.parsers import MultiPartParser
+from rest_framework.response import Response
+from django.views.decorators.csrf import csrf_exempt  # Still needed if CSRF is enabled
 
 # Load TFLite model
 interpreter = tf.lite.Interpreter(model_path='model.tflite')
@@ -45,12 +47,17 @@ def process_video(video_path, sequence_length=30):
         sequence.append(np.zeros(225))
     return np.array(sequence)
 
-@csrf_exempt
+@csrf_exempt  # Optional if CSRF middleware is disabled
+@api_view(['POST'])
+@parser_classes([MultiPartParser])
 def predict_sign(request):
-    if request.method == 'POST' and request.FILES.get('video'):
-        video_file = request.FILES['video']
-        temp_video_path = f'media/{video_file.name}'
+    video_file = request.FILES.get('video')
+    if not video_file:
+        return Response({'error': 'No video file provided'}, status=400)
+
+    try:
         os.makedirs('media', exist_ok=True)
+        temp_video_path = f'media/{video_file.name}'
         with open(temp_video_path, 'wb+') as dest:
             for chunk in video_file.chunks():
                 dest.write(chunk)
@@ -63,21 +70,10 @@ def predict_sign(request):
 
         prediction_idx = int(np.argmax(output_data))
         confidence = float(np.max(output_data))
-
         labels = ['hello', 'ikinagagalak kong makilala ka', 'magkita tayo bukas']
 
         os.remove(temp_video_path)
 
-        return JsonResponse({'prediction': labels[prediction_idx], 'confidence': confidence})
-    return JsonResponse({'error': 'Invalid request'}, status=400)
-
-
-
-
-
-
-
-
-
-
-
+        return Response({'prediction': labels[prediction_idx], 'confidence': confidence})
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
