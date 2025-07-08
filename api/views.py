@@ -3,31 +3,38 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import mediapipe as mp
+import aiofiles
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
-from django.views.decorators.csrf import csrf_exempt  # Still needed if CSRF is enabled
+from django.views.decorators.csrf import csrf_exempt
+from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
+import asyncio
 
-# Load TFLite model
-interpreter = tf.lite.Interpreter(model_path='model.tflite')
+# Load the model once
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'model.tflite')
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
-
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+# Mediapipe setup
 mp_holistic = mp.solutions.holistic
 
+# Extract keypoints
 def extract_keypoints(results):
     pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]) if results.pose_landmarks else np.zeros((33, 3))
     left_hand = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]) if results.left_hand_landmarks else np.zeros((21, 3))
     right_hand = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]) if results.right_hand_landmarks else np.zeros((21, 3))
     return np.concatenate([pose, left_hand, right_hand]).flatten()
 
+# Process video: optimized
 def process_video(video_path, sequence_length=30):
     sequence = []
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // sequence_length)
+    step = 5 if total_frames <= 60 else 10  # skip more frames if long
 
     with mp_holistic.Holistic(static_image_mode=False) as holistic:
         frame_count = 0
@@ -36,6 +43,7 @@ def process_video(video_path, sequence_length=30):
             if not ret:
                 break
             if frame_count % step == 0:
+                frame = cv2.resize(frame, (480, 360))  # faster processing
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
                 keypoints = extract_keypoints(results)
@@ -47,7 +55,13 @@ def process_video(video_path, sequence_length=30):
         sequence.append(np.zeros(225))
     return np.array(sequence)
 
-@csrf_exempt  # Optional if CSRF middleware is disabled
+# Save file async to /tmp/
+async def save_uploaded_file_async(video_file, path):
+    async with aiofiles.open(path, 'wb') as out_file:
+        for chunk in video_file.chunks():
+            await out_file.write(chunk)
+
+@csrf_exempt
 @api_view(['POST'])
 @parser_classes([MultiPartParser])
 def predict_sign(request):
@@ -56,12 +70,18 @@ def predict_sign(request):
         return Response({'error': 'No video file provided'}, status=400)
 
     try:
-        os.makedirs('media', exist_ok=True)
-        temp_video_path = f'media/{video_file.name}'
-        with open(temp_video_path, 'wb+') as dest:
-            for chunk in video_file.chunks():
-                dest.write(chunk)
+        # Save to /tmp/ for performance and avoid media issues
+        temp_video_path = os.path.join('/tmp', video_file.name)
 
+        # Save using async function
+        if isinstance(video_file, (InMemoryUploadedFile, TemporaryUploadedFile)):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(save_uploaded_file_async(video_file, temp_video_path))
+        else:
+            return Response({'error': 'Unsupported file type'}, status=400)
+
+        # Process
         sequence = process_video(temp_video_path)
         input_data = np.expand_dims(sequence.astype(np.float32), axis=0)
         interpreter.set_tensor(input_details[0]['index'], input_data)
@@ -76,4 +96,6 @@ def predict_sign(request):
 
         return Response({'prediction': labels[prediction_idx], 'confidence': confidence})
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return Response({'error': str(e)}, status=500)
